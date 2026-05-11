@@ -1,0 +1,393 @@
+---
+title: "Differential Methylation Analysis"
+author: "Sophia Sedille"
+date: "2025-01-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r libraries, include=FALSE}
+# devtools::install_github('bmbolstad/preprocessCore', dependencies = T, upgrade = 'always', configure.args = '--disable-threading')
+
+# Epigenetic packages
+library(limma)
+library(minfi)
+library(EpiSmokEr)
+library(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+library(IlluminaHumanMethylationEPICmanifest)
+library(DMRcate)
+library(missMethyl)
+library(compareGroups)
+library(ramwas)
+library(FlowSorted.Blood.EPIC)
+library(ChAMP)
+library(openxlsx)
+library(qvalue)
+
+# Statistics
+library(corpcor)
+
+# Data handling and visualisation
+library(openxlsx2)
+library(tidyverse)
+library(doParallel)
+library(RColorBrewer)
+library(Gviz)
+library(gplots)
+library(ggbeeswarm)
+library(ggpmisc)
+library(ggpubr)
+library(see)
+library(filematrix)
+library(gprofiler2)
+library(plotly)
+
+recalculate <- FALSE
+```
+
+
+```{r user_paths}
+# -------------------------------------------------------
+# USER CONFIGURATION: Set these paths before running!
+# -------------------------------------------------------
+
+# Path to CSV file with PGS data (wide format, unscaled)
+PATH_TO_PGS_DATA    <- "path/to/ADHD_PGSData_wide_unscaled.csv"
+
+# Path to preprocessed targets RDS file
+PATH_TO_TARGETS     <- "path/to/ProcessedData/targets.rds"
+
+# Path to merged EPIC methylation data RDS file
+PATH_TO_EPIC_MERGED <- "path/to/ProcessedData/all_EPIC_merged.rds"
+
+# Output folder (must exist before running)
+OUTPUT_FOLDER       <- "path/to/output/"
+
+# -------------------------------------------------------
+```
+
+
+## Load and merge phenotypic data
+
+```{r load_data}
+pgs_data <- read_csv(PATH_TO_PGS_DATA)
+pgs_data <- pgs_data[, c("Sample_Name", "ADHD")]  # keep only relevant columns
+
+targets <- readRDS(PATH_TO_TARGETS)
+targets$Sample_Name <- substr(targets$Sample_Name, 1, 8)  # remove T1 suffix
+
+# Merge targets with PGS data
+merged_table <- merge(targets, pgs_data, by = "Sample_Name")
+colnames(merged_table)[colnames(merged_table) == "ADHD"] <- "ADHD_PGS"
+merged_table$ADHD_PGS_scaled <- scale(merged_table$ADHD_PGS)
+merged_table <- relocate(merged_table,
+                         c(ADHD_PGS, ADHD_PGS_scaled, ADHD.average,
+                           ADHD.hyperactivity, ADHD.inattention, SES_bin),
+                         .after = Sample_ID)
+```
+
+
+## Preprocessing and calling of methylation data
+
+```{r preprocessing}
+allEPIC_merged <- readRDS(PATH_TO_EPIC_MERGED)
+
+mqSet <- preprocessQuantile(allEPIC_merged)
+mVals <- getM(mqSet)
+bVals <- getBeta(mqSet)
+
+rm(allEPIC_merged)
+gc()
+```
+
+
+## Define SES variable
+
+```{r define_ses}
+targets$SES <- targets$Parental..highest..education.at.T1.in.education.categories.based.on.ISCED...based.on.school.leaving.qualification.and.training
+targets$SES[targets$SES == 77] <- NA
+targets$SES_bin <- factor(targets$SES > median(targets$SES, na.rm = TRUE),
+                          levels = c(TRUE, FALSE),
+                          labels = c("lowED", "highED"))
+```
+
+
+Some participants have multiple rows in `merged_table`. We check why:
+
+```{r check_duplicates}
+merged_table %>%
+  filter(n() > 1, .by = Sample_Name) %>%
+  View()
+```
+
+10 participants have 2 different PGS values for ADHD. We keep only the first entry per participant.
+
+```{r deduplicate}
+merged_table_dedup <- merged_table %>%
+  slice_head(n = 1, by = Sample_Name)
+```
+
+Verify deduplication:
+
+```{r check_dedup}
+length(unique(merged_table_dedup$Sample_Name)) == nrow(merged_table_dedup)
+```
+
+```{r rownames}
+rownames(merged_table_dedup) <- merged_table_dedup$index
+```
+
+
+## Differential methylation analysis using limma
+
+```{r limma_analysis}
+# Quick check: ADHD ~ covariates
+lm(ADHD.average ~ Gender + Age + SES_bin, data = targets) %>% summary()
+
+# Design matrix: triple interaction ADHD * SES * PGS
+design <- model.matrix(
+  ~1 + Gender + Age + Smoking_Scores + CD8T + CD4T + NK + Bcell + Mono + Neu +
+    ADHD.average * SES_bin * ADHD_PGS_scaled,
+  data = merged_table_dedup
+)
+mdata <- mVals[, rownames(design)]
+
+# Fit linear model and apply empirical Bayes
+fit  <- limma::lmFit(mdata, design)
+fit2 <- limma::eBayes(fit)
+
+# Extract results for the triple interaction term
+res <- topTable(fit2, coef = "ADHD.average:SES_binhighED:ADHD_PGS_scaled", number = nrow(mdata))
+head(res)
+
+# Significant CpGs: p < 0.01 and |logFC| > 1.5
+sig_cpg <- rownames(res)[res$P.Value < 0.01 & abs(res$logFC) > 1.5]
+length(sig_cpg)
+
+# Save decision test summary
+summary_output <- capture.output(summary(decideTests(fit2, adjust.method = "none", p.value = 0.01)))
+writeLines(summary_output, con = paste0(OUTPUT_FOLDER, "decideTests_summary_output.txt"))
+```
+
+```{r top_cpg}
+# CpG with the smallest p-value among significant hits
+sig_res      <- res[sig_cpg, ]
+min_pval_cpg <- rownames(sig_res)[which.min(sig_res$P.Value)]
+sig_res[which.min(sig_res$P.Value), ]
+```
+
+
+## Exploratory plots (not included in thesis)
+
+```{r exploratory_plots}
+sig_cpg_mvals <- t(mVals[sig_cpg, rownames(merged_table_dedup)])
+tmp_data <- cbind(merged_table_dedup, sig_cpg_mvals)
+tmp_data <- tmp_data %>% filter(!is.na(SES_bin))
+
+tmp_data$ADHD_PGS_scaled_bin <- factor(
+  tmp_data$ADHD_PGS_scaled > median(tmp_data$ADHD_PGS_scaled, na.rm = TRUE),
+  levels = c(TRUE, FALSE), labels = c("low PGS", "high PGS")
+)
+
+plotlist <- list()
+for (i in sig_cpg) {
+  target_cpg <- i
+  res_lm <- lm(as.formula(paste0(target_cpg, "~ 1 + Gender + Age + Smoking_Scores + CD8T + CD4T + NK + Bcell + Mono + Neu")),
+               data = tmp_data)
+  tmp_data[target_cpg] <- res_lm$residuals
+
+  plotlist[[i]] <- ggplot(tmp_data, aes_string(x = "ADHD.average", y = target_cpg)) +
+    geom_point() +
+    facet_wrap(~SES_bin + ADHD_PGS_scaled_bin) +
+    geom_smooth(method = "lm") +
+    stat_fit_glance(method = "lm",
+                    method.args = list(formula = y ~ x),
+                    label.x = 0.5, label.y = 1,
+                    aes(label = paste("p =", signif(..p.value.., 4),
+                                      "  R² =", signif(..r.squared.., 3))),
+                    size = 4)
+}
+
+combined_plot <- ggarrange(plotlist = plotlist, ncol = 2, nrow = 3)
+ggsave(paste0(OUTPUT_FOLDER, "combined_plot.png"), plot = combined_plot[[1]], width = 12, height = 8, dpi = 300)
+```
+
+
+## Four CpGs of interest (used in thesis)
+
+```{r four_cpgs}
+cpgs_of_interest <- c("cg02700878", "cg17833746", "cg24312520", "cg14932016")
+cpg_mvals <- t(mVals[cpgs_of_interest, rownames(merged_table_dedup)])
+tmp_data  <- cbind(merged_table_dedup, cpg_mvals)
+
+# Keep only complete cases for the relevant columns
+key_cols <- c(cpgs_of_interest, "ADHD_PGS_scaled", "SES_bin", "ADHD.average")
+tmp_data <- tmp_data[complete.cases(tmp_data[, key_cols]), ]
+
+# Binary groupings
+tmp_data$ADHD_bin <- factor(
+  tmp_data$ADHD.average > median(tmp_data$ADHD.average, na.rm = TRUE),
+  levels = c(TRUE, FALSE), labels = c("high ADHD", "low ADHD")
+)
+tmp_data$SES_ADHD_bin <- interaction(tmp_data$SES_bin, tmp_data$ADHD_bin, sep = " & ")
+```
+
+
+## Visualise association between ADHD-PGS and methylation across SES and ADHD severity groups
+
+```{r visualize_cpgs}
+plotlist <- list()
+for (i in cpgs_of_interest) {
+  target_cpg <- i
+
+  # Regress out covariates and use residuals
+  res_lm <- lm(as.formula(paste0(target_cpg, "~ 1 + Gender + Age + Smoking_Scores + CD8T + CD4T + NK + Bcell + Mono + Neu")),
+               data = tmp_data)
+  tmp_data[[target_cpg]] <- res_lm$residuals
+
+  plotlist[[i]] <- ggplot(tmp_data, aes_string(x = "ADHD_PGS_scaled", y = target_cpg)) +
+    geom_point(alpha = 0.6, size = 1.5) +
+    facet_wrap(~SES_ADHD_bin) +
+    geom_smooth(method = "lm", color = "slateblue", se = FALSE) +
+    stat_fit_glance(method = "lm",
+                    method.args = list(formula = y ~ x),
+                    label.x = 0.5, label.y = 1,
+                    aes(label = paste("p =", signif(..p.value.., 3),
+                                      "| R² =", signif(..r.squared.., 3))),
+                    size = 4) +
+    labs(title = paste("CpG:", i), x = "ADHD PGS (scaled)", y = i) +
+    theme_minimal(base_size = 12) +
+    theme(strip.text = element_text(size = 12, face = "bold"),
+          axis.title = element_text(size = 12),
+          axis.text  = element_text(size = 10),
+          plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
+}
+
+combined_plot <- ggarrange(plotlist[[1]], plotlist[[2]], plotlist[[3]], plotlist[[4]],
+                           ncol = 2, nrow = 2)
+ggsave(paste0(OUTPUT_FOLDER, "cpg_plots.pdf"), combined_plot, width = 12, height = 8)
+```
+
+```{r, fig.width=8, fig.height=12}
+ggpubr::ggarrange(plotlist = plotlist, ncol = 2, nrow = 3)
+```
+
+
+## Annotate differentially methylated positions (DMPs)
+
+```{r annotate_dmps}
+anno_epic     <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+anno_epic_sub <- anno_epic[match(rownames(mVals), anno_epic$Name),
+                           c(1:4, 12:19, 24:ncol(anno_epic))]
+rm(anno_epic)
+
+DMPs <- topTable(fit2, num = Inf, coef = "ADHD.average:SES_binhighED:ADHD_PGS_scaled",
+                 genelist = anno_epic_sub)
+head(DMPs)
+
+write_xlsx(DMPs, file = paste0(OUTPUT_FOLDER, "DMPs.xlsx"))
+```
+
+
+## Gene Set Enrichment Analysis of DMP genes using gprofiler2
+
+```{r gsea_dmps}
+gene_list <- unique(unlist(strsplit(DMPs$GencodeCompV12_NAME[DMPs$P.Value < 0.01], ";")))
+
+gost_res <- gost(query = list("DMPs_average_SES_PGS" = gene_list), organism = "hsapiens")
+head(gost_res$result)
+
+p <- gostplot(gost_res, capped = FALSE, interactive = TRUE)
+p
+
+publish_gostplot(p, filename = paste0(OUTPUT_FOLDER, "gostplot_DMPs.pdf"))
+```
+
+Top 10 hits sorted by p-value:
+
+```{r top10_hits}
+go_results     <- gost_res$result
+sorted_results <- go_results[order(go_results$p_value), ]
+top10_results  <- sorted_results[1:10, c("term_name", "p_value", "intersection_size", "term_id")]
+print(top10_results)
+
+write.csv(go_results,    paste0(OUTPUT_FOLDER, "gostres_DMPs.csv"),       row.names = FALSE)
+write.csv(top10_results, paste0(OUTPUT_FOLDER, "gostres_DMPs_top10.csv"), row.names = FALSE)
+```
+
+
+## Differentially Methylated Regions (DMRs) using DMRcate
+
+```{r dmrcate_annotate}
+my_annotation <- cpg.annotate(object = mdata, datatype = "array", what = "M",
+                              annotation = c(array = "IlluminaHumanMethylationEPIC",
+                                             annotation = "ilm10b2.hg19"),
+                              analysis.type = "differential", design = design,
+                              contrasts = FALSE,
+                              coef = "ADHD.average:SES_binhighED:ADHD_PGS_scaled",
+                              arraytype = "EPICv1")
+```
+
+```{r dmrcate_extract}
+DMRs           <- dmrcate(my_annotation, lambda = 1000, C = 2, pcutoff = 0.01)
+results_ranges <- extractRanges(DMRs)
+
+# Extract chromosome names from coordinate string
+chr_names <- sapply(strsplit(DMRs@coord, ":"), function(x) x[1])
+results_ranges$seqnames <- chr_names
+
+head(results_ranges$overlapping.genes)
+head(results_ranges$seqnames)
+```
+
+```{r save_dmrs}
+results_df <- as.data.frame(results_ranges)
+write.csv(results_df, paste0(OUTPUT_FOLDER, "DMRs_results.csv"), row.names = FALSE)
+```
+
+
+## Gene Set Enrichment Analysis of DMR genes (FDR < 0.1)
+
+```{r gsea_dmrs}
+gene_list_dmr <- unique(unlist(strsplit(
+  results_ranges$overlapping.genes[results_ranges$min_smoothed_fdr < 0.1], ","
+)))
+
+gost_res_dmr <- gost(query = gene_list_dmr, organism = "hsapiens")
+head(gost_res_dmr$result)
+
+p_dmr <- gostplot(gost_res_dmr, capped = FALSE, interactive = TRUE)
+p_dmr
+```
+
+```{r save_gsea_dmrs}
+# Convert list columns to character strings before saving
+gost_clean <- gost_res_dmr$result
+gost_clean[] <- lapply(gost_clean, function(col) {
+  if (is.list(col)) sapply(col, toString) else col
+})
+
+write.csv(gost_clean, paste0(OUTPUT_FOLDER, "gostres_DMRs.csv"), row.names = FALSE)
+```
+
+
+## Convert DMRs to GRanges object
+
+```{r granges}
+dmr_gr <- GRanges(
+  seqnames          = results_ranges$seqnames,
+  ranges            = IRanges(start = start(results_ranges), end = end(results_ranges)),
+  strand            = results_ranges$strand,
+  min_smoothed_fdr  = results_ranges$min_smoothed_fdr,
+  meandiff          = results_ranges$meandiff,
+  overlapping_genes = results_ranges$overlapping.genes
+)
+
+options(showTailLines = Inf)
+print(dmr_gr)
+write.csv(as.data.frame(dmr_gr), paste0(OUTPUT_FOLDER, "DMRs_granges.csv"))
+```
